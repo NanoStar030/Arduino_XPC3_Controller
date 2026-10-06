@@ -1,0 +1,1057 @@
+// main_muti_motor.cpp
+// Function:
+// 1. Receive commands from serial port
+// 2. Control single / dual stepper motors
+// 3. Run ARC motion by splitting the path into 1-degree dual-motion segments
+
+#include "main.h" // Motor parameters / structures here
+#include <math.h>
+#include <Arduino.h>
+
+Motor motors[] = {
+    {11, 10, 99},   // Motor 0 {step, dir, enable}
+    {13, 12, 99},   // Motor 1
+    {6, 7, 9},      // Motor 2
+    {4, 5, 8}       // Motor 3
+};
+
+char lineBuf[LINE_BUF_SIZE];
+int lineIndex = 0;
+SystemState systemState = SystemState::IDLE;
+
+AxisMoveCommand currentMove_A;
+AxisMotionRuntime Motion_A;
+
+DualMoveCommand currentMove_D;
+DualMotionRuntime Motion_D;
+
+ArcMoveCommand currentMove_Arc;
+ArcMotionRuntime Motion_Arc;
+
+// ==================================================
+// ARC SETTINGS
+// ==================================================
+
+const int ARC_DEG_PER_POINT = 1;       // 1 degree per segment
+const int ARC_RAMP_SEGMENTS = 3;       // short start/end ramp
+const float ARC_START_TIME_SCALE = 2.0f;
+
+// ==================================================
+// FUNCTION DECLARATIONS
+// ==================================================
+
+void handleMoveCommand_A(char *cmd);
+void startMotion_A();
+
+void handleMoveCommand_D(char *cmd);
+void startMotion_D();
+
+void handleMoveCommand_Arc(char *cmd);
+void startMotion_Arc();
+void loadNextArcSegment();
+void finishMotion_Arc();
+
+PointStatus getArcPointStatus(int segmentIndex, int totalSegments);
+float getArcTimeScale(PointStatus status, int segmentIndex, int totalSegments);
+
+// ==================================================
+// SYSTEM FUNCTIONS
+// ==================================================
+
+void AxisPulse(Motor &motor, unsigned long highPulseUS = 10)
+{
+    digitalWrite(motor.stepPin, HIGH);
+    delayMicroseconds(highPulseUS);
+    digitalWrite(motor.stepPin, LOW);
+}
+
+void DualPulse(bool stepA, bool stepB, unsigned long highPulseUS = 10)
+{
+    if (stepA)
+        digitalWrite(motors[currentMove_D.motorA.motorIdx].stepPin, HIGH);
+
+    if (stepB)
+        digitalWrite(motors[currentMove_D.motorB.motorIdx].stepPin, HIGH);
+
+    delayMicroseconds(highPulseUS);
+
+    if (stepA)
+        digitalWrite(motors[currentMove_D.motorA.motorIdx].stepPin, LOW);
+
+    if (stepB)
+        digitalWrite(motors[currentMove_D.motorB.motorIdx].stepPin, LOW);
+}
+
+bool getNextToken(char *&token)
+{
+    token = strtok(NULL, " ");
+
+    if (token == NULL)
+    {
+        Serial.println("[ERROR] Command Format Error...");
+        return false;
+    }
+
+    return true;
+}
+
+void initMotion(
+    AxisMotionRuntime &motion,
+    const AxisMoveCommand &currentMove,
+    bool useRamp)
+{
+    motion.stepTicks = labs(currentMove.stepNUM);
+    motion.ticksIndex = 0;
+
+    motion.targetDelayUS = currentMove.stepDelayUS;
+
+    if (motion.targetDelayUS < 1)
+        motion.targetDelayUS = 1;
+
+    motion.lastStepUS = micros();
+
+    // --------------------------------------------------
+    // Motion timing initialization
+    // --------------------------------------------------
+
+    if (
+        useRamp &&
+        motion.stepTicks >= 2 &&
+        motion.targetDelayUS < START_DELAY_US)
+    {
+        motion.rampTicks = currentMove.rampTicks;
+
+        // If ramp is not specified, use 1/4 of the motion.
+        if (motion.rampTicks < 1)
+            motion.rampTicks = motion.stepTicks / 4;
+
+        if (motion.rampTicks < 1)
+            motion.rampTicks = 1;
+
+        if (motion.rampTicks > motion.stepTicks / 2)
+            motion.rampTicks = motion.stepTicks / 2;
+
+        motion.deltaDelayUS =
+            (START_DELAY_US - motion.targetDelayUS) /
+            motion.rampTicks;
+
+        if (motion.deltaDelayUS < 1)
+            motion.deltaDelayUS = 1;
+
+        motion.currentDelayUS = START_DELAY_US;
+    }
+    else
+    {
+        // ARC segments use this branch so each 1-degree segment
+        // does not restart an internal acceleration ramp.
+        motion.rampTicks = 0;
+        motion.deltaDelayUS = 0;
+        motion.currentDelayUS = motion.targetDelayUS;
+    }
+
+    // --------------------------------------------------
+    // Motor hardware initialization
+    // --------------------------------------------------
+
+    Motor &targetMotor = motors[currentMove.motorIdx];
+
+    digitalWrite(
+        targetMotor.dirPin,
+        currentMove.dir == Direction::POSITIVE);
+
+    if (targetMotor.enaPin != 99)
+        digitalWrite(targetMotor.enaPin, LOW);
+}
+
+// Default wrapper for normal S_MOVE / D_MOVE.
+void initMotion(
+    AxisMotionRuntime &motion,
+    const AxisMoveCommand &currentMove)
+{
+    initMotion(motion, currentMove, true);
+}
+
+void updateAxisSpeedProfile(
+    AxisMotionRuntime &motion,
+    PointStatus pointStatus)
+{
+    if (motion.rampTicks <= 0 || motion.deltaDelayUS == 0)
+    {
+        motion.currentDelayUS = motion.targetDelayUS;
+        return;
+    }
+
+    bool allowAcceleration =
+        pointStatus == PointStatus::ACCELERATING ||
+        pointStatus == PointStatus::FULL_RANGE;
+
+    bool allowDeceleration =
+        pointStatus == PointStatus::DECELERATING ||
+        pointStatus == PointStatus::FULL_RANGE;
+
+    // Acceleration
+    if (
+        allowAcceleration &&
+        motion.ticksIndex < motion.rampTicks)
+    {
+        if (
+            motion.currentDelayUS >
+            motion.targetDelayUS + motion.deltaDelayUS)
+        {
+            motion.currentDelayUS -= motion.deltaDelayUS;
+        }
+        else
+        {
+            motion.currentDelayUS = motion.targetDelayUS;
+        }
+    }
+
+    // Deceleration
+    else if (
+        allowDeceleration &&
+        motion.ticksIndex >= motion.stepTicks - motion.rampTicks)
+    {
+        motion.currentDelayUS += motion.deltaDelayUS;
+
+        if (motion.currentDelayUS > START_DELAY_US)
+            motion.currentDelayUS = START_DELAY_US;
+    }
+
+    // Constant speed
+    else
+    {
+        motion.currentDelayUS = motion.targetDelayUS;
+    }
+}
+
+const char *getSystemStateName(SystemState state)
+{
+    switch (state)
+    {
+        case SystemState::IDLE:        return "IDLE";
+        case SystemState::S_RUNNING:   return "SINGLE_RUNNING";
+        case SystemState::D_RUNNING:   return "DUAL_RUNNING";
+        case SystemState::ARC_RUNNING: return "ARC_RUNNING";
+        case SystemState::ERROR:       return "ERROR";
+        default:                       return "UNKNOWN";
+    }
+}
+
+void stopDualMotors()
+{
+    if (motors[currentMove_D.motorA.motorIdx].enaPin != 99)
+        digitalWrite(motors[currentMove_D.motorA.motorIdx].enaPin, HIGH);
+
+    if (motors[currentMove_D.motorB.motorIdx].enaPin != 99)
+        digitalWrite(motors[currentMove_D.motorB.motorIdx].enaPin, HIGH);
+}
+
+void handleCommand(char *cmd)
+{
+    if (strlen(cmd) == 0)
+        return;
+
+    if (strcmp(cmd, "PING") == 0)
+    {
+        Serial.println("PONG");
+    }
+
+    else if (strcmp(cmd, "STATUS") == 0)
+    {
+        Serial.println(getSystemStateName(systemState));
+    }
+
+    else if (strcmp(cmd, "STOP") == 0)
+    {
+        if (systemState == SystemState::S_RUNNING)
+        {
+            if (motors[currentMove_A.motorIdx].enaPin != 99)
+                digitalWrite(motors[currentMove_A.motorIdx].enaPin, HIGH);
+
+            systemState = SystemState::IDLE;
+            Serial.println("[OK] Stopping the motor...");
+        }
+
+        else if (
+            systemState == SystemState::D_RUNNING ||
+            systemState == SystemState::ARC_RUNNING)
+        {
+            stopDualMotors();
+            Motion_Arc.active = false;
+            systemState = SystemState::IDLE;
+            Serial.println("[OK] Stopping the motor...");
+        }
+
+        else
+        {
+            Serial.println("[Error] Not Running Now...");
+        }
+    }
+
+    else if (strcmp(cmd, "GET_CONFIG") == 0)
+    {
+        Serial.println("[OK] Returning the Configs...");
+        Serial.print("CONFIG motors_number=");
+        Serial.print(MOTOR_COUNT);
+
+        Serial.print(" start_delay_us=");
+        Serial.print(START_DELAY_US);
+
+        Serial.print(" max_delay_us=");
+        Serial.println(MAX_DELAY_US);
+    }
+
+    else if (strncmp(cmd, "S_MOVE ", 7) == 0)
+    {
+        if (systemState != SystemState::IDLE)
+        {
+            Serial.println("[Error] System is Busy Now...");
+            return;
+        }
+
+        handleMoveCommand_A(cmd);
+    }
+
+    else if (strncmp(cmd, "D_MOVE ", 7) == 0)
+    {
+        if (systemState != SystemState::IDLE)
+        {
+            Serial.println("[Error] System is Busy Now...");
+            return;
+        }
+
+        handleMoveCommand_D(cmd);
+    }
+
+    else if (strncmp(cmd, "ARC ", 4) == 0)
+    {
+        if (systemState != SystemState::IDLE)
+        {
+            Serial.println("[Error] System is Busy Now...");
+            return;
+        }
+
+        handleMoveCommand_Arc(cmd);
+    }
+
+    else
+    {
+        Serial.println("[Error] Unknown Command...");
+    }
+}
+
+// ==================================================
+// AXIS MOTION
+// ==================================================
+
+void handleMoveCommand_A(char *cmd)
+{
+    char *token;
+    token = strtok(cmd, " "); // S_MOVE
+
+    // Motor
+    if (!getNextToken(token)) return;
+    currentMove_A.motorIdx = atoi(token);
+
+    if (
+        currentMove_A.motorIdx < 0 ||
+        currentMove_A.motorIdx >= MOTOR_COUNT)
+    {
+        Serial.println("[ERROR] Invalid Motor...");
+        return;
+    }
+
+    // Direction
+    if (!getNextToken(token)) return;
+    int dir = atoi(token);
+
+    if (dir == 0)
+        currentMove_A.dir = Direction::NEGATIVE;
+    else if (dir == 1)
+        currentMove_A.dir = Direction::POSITIVE;
+    else
+    {
+        Serial.println("[ERROR] Direction Must Be 0 or 1...");
+        return;
+    }
+
+    // Steps
+    if (!getNextToken(token)) return;
+    currentMove_A.stepNUM = atol(token);
+
+    // Step Delay
+    if (!getNextToken(token)) return;
+    currentMove_A.stepDelayUS = atol(token);
+
+    // Ramp
+    if (!getNextToken(token)) return;
+    currentMove_A.rampTicks = atol(token);
+
+    if (
+        currentMove_A.stepNUM <= 0 ||
+        currentMove_A.stepDelayUS == 0 ||
+        currentMove_A.rampTicks < 0)
+    {
+        Serial.println("[ERROR] Invalid S_MOVE Parameter...");
+        return;
+    }
+
+    startMotion_A();
+
+    Serial.print("[OK] Motor ");
+    Serial.print(currentMove_A.motorIdx);
+    Serial.println(" is Running...");
+}
+
+void startMotion_A()
+{
+    initMotion(Motion_A, currentMove_A);
+    systemState = SystemState::S_RUNNING;
+}
+
+// ==================================================
+// DUAL MOTION
+// ==================================================
+
+void handleMoveCommand_D(char *cmd)
+{
+    char *token;
+    token = strtok(cmd, " "); // D_MOVE
+
+    // --------------------------------------------------
+    // Motor A
+    // --------------------------------------------------
+
+    if (!getNextToken(token)) return;
+    currentMove_D.motorA.motorIdx = atoi(token);
+
+    if (
+        currentMove_D.motorA.motorIdx < 0 ||
+        currentMove_D.motorA.motorIdx >= MOTOR_COUNT)
+    {
+        Serial.println("[ERROR] Invalid Motor A...");
+        return;
+    }
+
+    if (!getNextToken(token)) return;
+    int dirA = atoi(token);
+
+    if (dirA == 0)
+        currentMove_D.motorA.dir = Direction::NEGATIVE;
+    else if (dirA == 1)
+        currentMove_D.motorA.dir = Direction::POSITIVE;
+    else
+    {
+        Serial.println("[ERROR] Direction Must Be 0 or 1...");
+        return;
+    }
+
+    if (!getNextToken(token)) return;
+    currentMove_D.motorA.stepNUM = atol(token);
+
+    if (!getNextToken(token)) return;
+    currentMove_D.motorA.stepDelayUS = atol(token);
+
+    // --------------------------------------------------
+    // Motor B
+    // --------------------------------------------------
+
+    if (!getNextToken(token)) return;
+    currentMove_D.motorB.motorIdx = atoi(token);
+
+    if (
+        currentMove_D.motorB.motorIdx < 0 ||
+        currentMove_D.motorB.motorIdx >= MOTOR_COUNT)
+    {
+        Serial.println("[ERROR] Invalid Motor B...");
+        return;
+    }
+
+    if (!getNextToken(token)) return;
+    int dirB = atoi(token);
+
+    if (dirB == 0)
+        currentMove_D.motorB.dir = Direction::NEGATIVE;
+    else if (dirB == 1)
+        currentMove_D.motorB.dir = Direction::POSITIVE;
+    else
+    {
+        Serial.println("[ERROR] Direction Must Be 0 or 1...");
+        return;
+    }
+
+    if (!getNextToken(token)) return;
+    currentMove_D.motorB.stepNUM = atol(token);
+
+    if (!getNextToken(token)) return;
+    currentMove_D.motorB.stepDelayUS = atol(token);
+
+    // Normal D_MOVE uses the default automatic ramp.
+    currentMove_D.motorA.rampTicks = 0;
+    currentMove_D.motorB.rampTicks = 0;
+
+    // --------------------------------------------------
+    // Parameter checking
+    // --------------------------------------------------
+
+    if (
+        currentMove_D.motorA.motorIdx ==
+        currentMove_D.motorB.motorIdx)
+    {
+        Serial.println("[ERROR] Motor A and Motor B Cannot Be The Same...");
+        return;
+    }
+
+    if (
+        currentMove_D.motorA.stepNUM == 0 &&
+        currentMove_D.motorB.stepNUM == 0)
+    {
+        Serial.println("[ERROR] Both Steps Cannot Be Zero...");
+        return;
+    }
+
+    if (
+        (currentMove_D.motorA.stepNUM > 0 && currentMove_D.motorA.stepDelayUS == 0) ||
+        (currentMove_D.motorB.stepNUM > 0 && currentMove_D.motorB.stepDelayUS == 0))
+    {
+        Serial.println("[ERROR] Invalid Step Delay...");
+        return;
+    }
+
+    startMotion_D();
+
+    Serial.println("[OK] Dual Motion Started...");
+}
+
+void startMotion_D()
+{
+    initMotion(Motion_D.motorA, currentMove_D.motorA);
+    initMotion(Motion_D.motorB, currentMove_D.motorB);
+
+    Motion_D.pointStatus = PointStatus::FULL_RANGE;
+    systemState = SystemState::D_RUNNING;
+}
+
+// ==================================================
+// ARC MOTION
+// ==================================================
+
+// Command format:
+// ARC motorA motorB radiusA_steps radiusB_steps angle_deg dir segmentTimeUS
+//
+// dir:
+// 0 = CW
+// 1 = CCW
+//
+// radiusA_steps / radiusB_steps are already converted by the Python GUI.
+// segmentTimeUS is the desired time for each 1-degree ARC segment.
+// Because every segment is 1 degree, a constant segmentTimeUS gives an
+// approximately constant path speed through the middle of the ARC.
+void handleMoveCommand_Arc(char *cmd)
+{
+    char *token;
+    token = strtok(cmd, " "); // ARC
+
+    // Motor A
+    if (!getNextToken(token)) return;
+    currentMove_Arc.motorA = atoi(token);
+
+    // Motor B
+    if (!getNextToken(token)) return;
+    currentMove_Arc.motorB = atoi(token);
+
+    // Radius in Motor-A steps
+    if (!getNextToken(token)) return;
+    currentMove_Arc.radiusStepsA = atol(token);
+
+    // Radius in Motor-B steps
+    if (!getNextToken(token)) return;
+    currentMove_Arc.radiusStepsB = atol(token);
+
+    // Total ARC angle
+    if (!getNextToken(token)) return;
+    currentMove_Arc.angleDeg = atoi(token);
+
+    // ARC direction
+    if (!getNextToken(token)) return;
+    int arcDir = atoi(token);
+
+    if (arcDir == 0)
+        currentMove_Arc.dir = ArcDirection::CW;
+    else if (arcDir == 1)
+        currentMove_Arc.dir = ArcDirection::CCW;
+    else
+    {
+        Serial.println("[ERROR] ARC Direction Must Be 0 or 1...");
+        return;
+    }
+
+    // Desired time for each 1-degree segment
+    if (!getNextToken(token)) return;
+    currentMove_Arc.segmentTimeUS = atol(token);
+
+    // Parameter validation
+    if (
+        currentMove_Arc.motorA < 0 ||
+        currentMove_Arc.motorA >= MOTOR_COUNT ||
+        currentMove_Arc.motorB < 0 ||
+        currentMove_Arc.motorB >= MOTOR_COUNT ||
+        currentMove_Arc.motorA == currentMove_Arc.motorB ||
+        currentMove_Arc.radiusStepsA <= 0 ||
+        currentMove_Arc.radiusStepsB <= 0 ||
+        currentMove_Arc.angleDeg <= 0 ||
+        currentMove_Arc.angleDeg > 360 ||
+        currentMove_Arc.segmentTimeUS == 0)
+    {
+        Serial.println("[ERROR] Invalid ARC Parameter...");
+        return;
+    }
+
+    startMotion_Arc();
+}
+
+PointStatus getArcPointStatus(
+    int segmentIndex,
+    int totalSegments)
+{
+    int rampSegments = ARC_RAMP_SEGMENTS;
+
+    if (rampSegments > totalSegments / 2)
+        rampSegments = totalSegments / 2;
+
+    if (rampSegments < 1)
+        return PointStatus::CONSTANT_SPEED;
+
+    if (segmentIndex < rampSegments)
+        return PointStatus::ACCELERATING;
+
+    if (segmentIndex >= totalSegments - rampSegments)
+        return PointStatus::DECELERATING;
+
+    return PointStatus::CONSTANT_SPEED;
+}
+
+float getArcTimeScale(
+    PointStatus status,
+    int segmentIndex,
+    int totalSegments)
+{
+    int rampSegments = ARC_RAMP_SEGMENTS;
+
+    if (rampSegments > totalSegments / 2)
+        rampSegments = totalSegments / 2;
+
+    if (rampSegments <= 0)
+        return 1.0f;
+
+    // Short acceleration zone:
+    // segment time gradually decreases toward the requested value.
+    if (status == PointStatus::ACCELERATING)
+    {
+        if (rampSegments == 1)
+            return ARC_START_TIME_SCALE;
+
+        float progress =
+            (float)segmentIndex /
+            (float)(rampSegments - 1);
+
+        return
+            ARC_START_TIME_SCALE -
+            (ARC_START_TIME_SCALE - 1.0f) * progress;
+    }
+
+    // Short deceleration zone:
+    // segment time gradually increases away from the requested value.
+    if (status == PointStatus::DECELERATING)
+    {
+        int decelIndex =
+            segmentIndex -
+            (totalSegments - rampSegments);
+
+        if (rampSegments == 1)
+            return ARC_START_TIME_SCALE;
+
+        float progress =
+            (float)decelIndex /
+            (float)(rampSegments - 1);
+
+        return
+            1.0f +
+            (ARC_START_TIME_SCALE - 1.0f) * progress;
+    }
+
+    return 1.0f;
+}
+
+void startMotion_Arc()
+{
+    Motion_Arc.totalSegments =
+        currentMove_Arc.angleDeg / ARC_DEG_PER_POINT;
+
+    Motion_Arc.segmentIndex = 0;
+
+    // The current physical position is treated as the ARC 0-degree point:
+    // A = radiusA, B = 0, relative to the circle center.
+    Motion_Arc.previousStepA = currentMove_Arc.radiusStepsA;
+    Motion_Arc.previousStepB = 0;
+
+    Motion_Arc.active = true;
+    systemState = SystemState::ARC_RUNNING;
+
+    Serial.println("[OK] ARC Motion Started...");
+
+    loadNextArcSegment();
+}
+
+void loadNextArcSegment()
+{
+    while (Motion_Arc.segmentIndex < Motion_Arc.totalSegments)
+    {
+        // --------------------------------------------------
+        // Next 1-degree absolute ARC point
+        // --------------------------------------------------
+
+        float angleDeg =
+            (Motion_Arc.segmentIndex + 1) *
+            ARC_DEG_PER_POINT;
+
+        if (currentMove_Arc.dir == ArcDirection::CW)
+            angleDeg = -angleDeg;
+
+        float angleRad = angleDeg * (PI / 180.0f);
+
+        long nextStepA = lround(
+            currentMove_Arc.radiusStepsA * cos(angleRad));
+
+        long nextStepB = lround(
+            currentMove_Arc.radiusStepsB * sin(angleRad));
+
+        // --------------------------------------------------
+        // Convert absolute point into this segment's delta
+        // --------------------------------------------------
+
+        long deltaA =
+            nextStepA - Motion_Arc.previousStepA;
+
+        long deltaB =
+            nextStepB - Motion_Arc.previousStepB;
+
+        Motion_Arc.previousStepA = nextStepA;
+        Motion_Arc.previousStepB = nextStepB;
+
+        long stepsA = labs(deltaA);
+        long stepsB = labs(deltaB);
+
+        // A very small ARC can occasionally round to no step on both axes.
+        // Skip that segment without stopping the ARC.
+        if (stepsA == 0 && stepsB == 0)
+        {
+            Motion_Arc.segmentIndex++;
+            continue;
+        }
+
+        // --------------------------------------------------
+        // Point status controls only the overall segment time.
+        // There is no separate per-axis ramp inside an ARC segment.
+        // --------------------------------------------------
+
+        PointStatus pointStatus =
+            getArcPointStatus(
+                Motion_Arc.segmentIndex,
+                Motion_Arc.totalSegments);
+
+        Motion_D.pointStatus = pointStatus;
+
+        float timeScale =
+            getArcTimeScale(
+                pointStatus,
+                Motion_Arc.segmentIndex,
+                Motion_Arc.totalSegments);
+
+        unsigned long segmentTimeUS =
+            (unsigned long)(
+                currentMove_Arc.segmentTimeUS *
+                timeScale);
+
+        if (segmentTimeUS < 1)
+            segmentTimeUS = 1;
+
+        // --------------------------------------------------
+        // Configure Motor A for this segment
+        // --------------------------------------------------
+
+        currentMove_D.motorA.motorIdx = currentMove_Arc.motorA;
+        currentMove_D.motorA.stepNUM = stepsA;
+        currentMove_D.motorA.rampTicks = 0;
+
+        currentMove_D.motorA.dir =
+            (deltaA >= 0)
+            ? Direction::POSITIVE
+            : Direction::NEGATIVE;
+
+        if (stepsA > 0)
+        {
+            currentMove_D.motorA.stepDelayUS =
+                segmentTimeUS / stepsA;
+
+            if (currentMove_D.motorA.stepDelayUS < 1)
+                currentMove_D.motorA.stepDelayUS = 1;
+        }
+        else
+        {
+            currentMove_D.motorA.stepDelayUS = segmentTimeUS;
+        }
+
+        // --------------------------------------------------
+        // Configure Motor B for this segment
+        // --------------------------------------------------
+
+        currentMove_D.motorB.motorIdx = currentMove_Arc.motorB;
+        currentMove_D.motorB.stepNUM = stepsB;
+        currentMove_D.motorB.rampTicks = 0;
+
+        currentMove_D.motorB.dir =
+            (deltaB >= 0)
+            ? Direction::POSITIVE
+            : Direction::NEGATIVE;
+
+        if (stepsB > 0)
+        {
+            currentMove_D.motorB.stepDelayUS =
+                segmentTimeUS / stepsB;
+
+            if (currentMove_D.motorB.stepDelayUS < 1)
+                currentMove_D.motorB.stepDelayUS = 1;
+        }
+        else
+        {
+            currentMove_D.motorB.stepDelayUS = segmentTimeUS;
+        }
+
+        // --------------------------------------------------
+        // Initialize this small Dual segment WITHOUT an
+        // internal ramp. The ARC planner already controls
+        // acceleration / constant speed / deceleration.
+        // --------------------------------------------------
+
+        initMotion(
+            Motion_D.motorA,
+            currentMove_D.motorA,
+            false);
+
+        initMotion(
+            Motion_D.motorB,
+            currentMove_D.motorB,
+            false);
+
+        systemState = SystemState::ARC_RUNNING;
+
+        return;
+    }
+
+    finishMotion_Arc();
+}
+
+void finishMotion_Arc()
+{
+    Motion_Arc.active = false;
+
+    stopDualMotors();
+
+    systemState = SystemState::IDLE;
+
+    Serial.println("DONE");
+}
+
+// ==================================================
+// UPDATE FUNCTIONS
+// ==================================================
+
+void updateSerial()
+{
+    while (Serial.available() > 0)
+    {
+        char c = Serial.read();
+
+        if (c == '\n' || c == '\r')
+        {
+            lineBuf[lineIndex] = '\0';
+
+            if (lineIndex > 0)
+                handleCommand(lineBuf);
+
+            lineIndex = 0;
+        }
+        else
+        {
+            if (lineIndex < LINE_BUF_SIZE - 1)
+                lineBuf[lineIndex++] = c;
+        }
+    }
+}
+
+void updateMotion_A()
+{
+    if (systemState != SystemState::S_RUNNING)
+        return;
+
+    unsigned long now = micros();
+
+    if (
+        now - Motion_A.lastStepUS <
+        Motion_A.currentDelayUS)
+    {
+        return;
+    }
+
+    Motion_A.lastStepUS = now;
+
+    AxisPulse(motors[currentMove_A.motorIdx]);
+
+    Motion_A.ticksIndex++;
+
+    updateAxisSpeedProfile(
+        Motion_A,
+        PointStatus::FULL_RANGE);
+
+    // Finished
+    if (Motion_A.ticksIndex >= Motion_A.stepTicks)
+    {
+        systemState = SystemState::IDLE;
+
+        if (motors[currentMove_A.motorIdx].enaPin != 99)
+            digitalWrite(motors[currentMove_A.motorIdx].enaPin, HIGH);
+
+        Serial.println("DONE");
+    }
+}
+
+void updateMotion_D()
+{
+    if (
+        systemState != SystemState::D_RUNNING &&
+        systemState != SystemState::ARC_RUNNING)
+    {
+        return;
+    }
+
+    bool arcMode =
+        systemState == SystemState::ARC_RUNNING;
+
+    unsigned long now = micros();
+
+    bool stepA = false;
+    bool stepB = false;
+
+    // --------------------------------------------------
+    // Motor A elapsed-time scheduler
+    // --------------------------------------------------
+
+    if (
+        Motion_D.motorA.ticksIndex <
+        Motion_D.motorA.stepTicks)
+    {
+        if (
+            now - Motion_D.motorA.lastStepUS >=
+            Motion_D.motorA.currentDelayUS)
+        {
+            Motion_D.motorA.lastStepUS = now;
+            Motion_D.motorA.ticksIndex++;
+            stepA = true;
+        }
+    }
+
+    // --------------------------------------------------
+    // Motor B elapsed-time scheduler
+    // --------------------------------------------------
+
+    if (
+        Motion_D.motorB.ticksIndex <
+        Motion_D.motorB.stepTicks)
+    {
+        if (
+            now - Motion_D.motorB.lastStepUS >=
+            Motion_D.motorB.currentDelayUS)
+        {
+            Motion_D.motorB.lastStepUS = now;
+            Motion_D.motorB.ticksIndex++;
+            stepB = true;
+        }
+    }
+
+    // If both axes are ready in the same loop,
+    // their STEP signals go HIGH together.
+    if (stepA || stepB)
+        DualPulse(stepA, stepB);
+
+    // Normal D_MOVE uses the internal ramp profile.
+    // ARC mode does not: its segment time is already
+    // controlled by PointStatus in loadNextArcSegment().
+    if (!arcMode)
+    {
+        if (stepA)
+            updateAxisSpeedProfile(
+                Motion_D.motorA,
+                Motion_D.pointStatus);
+
+        if (stepB)
+            updateAxisSpeedProfile(
+                Motion_D.motorB,
+                Motion_D.pointStatus);
+    }
+
+    // --------------------------------------------------
+    // Segment / motion finished
+    // --------------------------------------------------
+
+    if (
+        Motion_D.motorA.ticksIndex >= Motion_D.motorA.stepTicks &&
+        Motion_D.motorB.ticksIndex >= Motion_D.motorB.stepTicks)
+    {
+        // ARC: immediately load the next 1-degree segment.
+        if (arcMode)
+        {
+            Motion_Arc.segmentIndex++;
+            loadNextArcSegment();
+            return;
+        }
+
+        // Normal D_MOVE ends here.
+        stopDualMotors();
+        systemState = SystemState::IDLE;
+        Serial.println("DONE");
+    }
+}
+
+// ==================================================
+// ARDUINO MAIN LOOP
+// ==================================================
+
+void setup()
+{
+    for (int i = 0; i < MOTOR_COUNT; i++)
+    {
+        pinMode(motors[i].stepPin, OUTPUT);
+        pinMode(motors[i].dirPin, OUTPUT);
+
+        digitalWrite(motors[i].stepPin, LOW);
+        digitalWrite(motors[i].dirPin, LOW);
+
+        if (motors[i].enaPin != 99)
+        {
+            pinMode(motors[i].enaPin, OUTPUT);
+            digitalWrite(motors[i].enaPin, HIGH);
+        }
+    }
+
+    Serial.begin(115200);
+    delay(500);
+    Serial.println("READY");
+}
+
+void loop()
+{
+    updateSerial();
+    updateMotion_A();
+    updateMotion_D();
+}

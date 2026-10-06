@@ -108,7 +108,7 @@ class StepperGUI:
 
         # =========================================================
         # Motor Control Notebook
-        # Manual / Loop / Dual Motor Control
+        # Manual / Loop / Dual / Arc Motor Control
         # =========================================================
         self.control_notebook = ttk.Notebook(self.root)
         self.control_notebook.pack(fill="x", padx=10, pady=6)
@@ -116,10 +116,12 @@ class StepperGUI:
         self.manual_tab = ttk.Frame(self.control_notebook)
         self.loop_tab = ttk.Frame(self.control_notebook)
         self.dual_tab = ttk.Frame(self.control_notebook)
+        self.arc_tab = ttk.Frame(self.control_notebook)
 
         self.control_notebook.add(self.manual_tab, text="Manual Motor Control")
         self.control_notebook.add(self.loop_tab, text="Loop Cycle")
         self.control_notebook.add(self.dual_tab, text="Dual Motor Control")
+        self.control_notebook.add(self.arc_tab, text="Arc Motion")
 
         # =========================================================
         # Tab 1: Manual Motor Control
@@ -323,73 +325,93 @@ class StepperGUI:
         # =========================================================
         # Tab 3: Dual Motor Control
         # Arduino command:
-        # D_MOVE motorA stepsA motorB stepsB delay_us ramp
-        # Positive / negative steps determine direction.
+        # D_MOVE motorA dirA stepsA delayA motorB dirB stepsB delayB
         # =========================================================
         dual_frame = ttk.Frame(self.dual_tab, padding=8)
         dual_frame.pack(fill="both", expand=True)
 
-        ttk.Label(dual_frame, text="Motor A").grid(row=0, column=0, padx=8, pady=(6, 4))
-        ttk.Label(dual_frame, text="Steps A").grid(row=0, column=1, padx=8, pady=(6, 4))
-        ttk.Label(dual_frame, text="Motor B").grid(row=0, column=2, padx=8, pady=(6, 4))
-        ttk.Label(dual_frame, text="Steps B").grid(row=0, column=3, padx=8, pady=(6, 4))
-        ttk.Label(dual_frame, text="Delay (us)").grid(row=0, column=4, padx=8, pady=(6, 4))
-        ttk.Label(dual_frame, text="Ramp").grid(row=0, column=5, padx=8, pady=(6, 4))
+        ttk.Label(dual_frame, text="Motor A").grid(row=0, column=0, padx=6, pady=(6, 4))
+        ttk.Label(dual_frame, text="Dir A").grid(row=0, column=1, padx=6, pady=(6, 4))
+        ttk.Label(dual_frame, text="Steps A").grid(row=0, column=2, padx=6, pady=(6, 4))
+        ttk.Label(dual_frame, text="Delay A (us)").grid(row=0, column=3, padx=6, pady=(6, 4))
+        ttk.Label(dual_frame, text="Motor B").grid(row=0, column=4, padx=6, pady=(6, 4))
+        ttk.Label(dual_frame, text="Dir B").grid(row=0, column=5, padx=6, pady=(6, 4))
+        ttk.Label(dual_frame, text="Steps B").grid(row=0, column=6, padx=6, pady=(6, 4))
+        ttk.Label(dual_frame, text="Delay B (us)").grid(row=0, column=7, padx=6, pady=(6, 4))
 
         self.dual_motor_a_var = tk.StringVar(value="0")
+        self.dual_dir_a_var = tk.StringVar(value="Dir 1")
         self.dual_steps_a_var = tk.StringVar(value="1000")
+        self.dual_delay_a_us_var = tk.StringVar(value="1000")
+
         self.dual_motor_b_var = tk.StringVar(value="3")
+        self.dual_dir_b_var = tk.StringVar(value="Dir 1")
         self.dual_steps_b_var = tk.StringVar(value="1000")
-        self.dual_delay_us_var = tk.StringVar(value="1000")
-        self.dual_ramp_var = tk.StringVar(value="200")
+        self.dual_delay_b_us_var = tk.StringVar(value="1000")
 
         ttk.Combobox(
             dual_frame,
             textvariable=self.dual_motor_a_var,
             values=[str(i) for i in range(MOTOR_COUNT)],
-            width=9,
+            width=7,
             state="readonly",
-        ).grid(row=1, column=0, padx=8, pady=(2, 8))
+        ).grid(row=1, column=0, padx=6, pady=(2, 8))
+
+        ttk.Combobox(
+            dual_frame,
+            textvariable=self.dual_dir_a_var,
+            values=["Dir 0", "Dir 1"],
+            width=7,
+            state="readonly",
+        ).grid(row=1, column=1, padx=6, pady=(2, 8))
 
         ttk.Entry(
             dual_frame,
             textvariable=self.dual_steps_a_var,
-            width=12,
-        ).grid(row=1, column=1, padx=8, pady=(2, 8))
+            width=10,
+        ).grid(row=1, column=2, padx=6, pady=(2, 8))
+
+        ttk.Entry(
+            dual_frame,
+            textvariable=self.dual_delay_a_us_var,
+            width=11,
+        ).grid(row=1, column=3, padx=6, pady=(2, 8))
 
         ttk.Combobox(
             dual_frame,
             textvariable=self.dual_motor_b_var,
             values=[str(i) for i in range(MOTOR_COUNT)],
-            width=9,
+            width=7,
             state="readonly",
-        ).grid(row=1, column=2, padx=8, pady=(2, 8))
+        ).grid(row=1, column=4, padx=6, pady=(2, 8))
+
+        ttk.Combobox(
+            dual_frame,
+            textvariable=self.dual_dir_b_var,
+            values=["Dir 0", "Dir 1"],
+            width=7,
+            state="readonly",
+        ).grid(row=1, column=5, padx=6, pady=(2, 8))
 
         ttk.Entry(
             dual_frame,
             textvariable=self.dual_steps_b_var,
-            width=12,
-        ).grid(row=1, column=3, padx=8, pady=(2, 8))
+            width=10,
+        ).grid(row=1, column=6, padx=6, pady=(2, 8))
 
         ttk.Entry(
             dual_frame,
-            textvariable=self.dual_delay_us_var,
-            width=12,
-        ).grid(row=1, column=4, padx=8, pady=(2, 8))
-
-        ttk.Entry(
-            dual_frame,
-            textvariable=self.dual_ramp_var,
-            width=12,
-        ).grid(row=1, column=5, padx=8, pady=(2, 8))
+            textvariable=self.dual_delay_b_us_var,
+            width=11,
+        ).grid(row=1, column=7, padx=6, pady=(2, 8))
 
         ttk.Label(
             dual_frame,
-            text="Steps 可輸入正負值：正值 = 正方向，負值 = 反方向；A、B 不可選同一顆 Motor。",
+            text="Dual mode uses independent elapsed-time control for Motor A and Motor B.",
         ).grid(
             row=2,
             column=0,
-            columnspan=6,
+            columnspan=8,
             padx=8,
             pady=(8, 6),
             sticky="w",
@@ -403,14 +425,121 @@ class StepperGUI:
         self.dual_move_btn.grid(
             row=3,
             column=0,
-            columnspan=6,
+            columnspan=8,
             padx=8,
             pady=(4, 10),
             sticky="ew",
         )
 
-        for col in range(6):
+        for col in range(8):
             dual_frame.columnconfigure(col, weight=1)
+
+        # =========================================================
+        # Tab 4: Arc Motion
+        # Arduino command:
+        # ARC motorA motorB radiusA_steps radiusB_steps angle_deg dir segmentTimeUS
+        # dir: 0 = CW, 1 = CCW
+        # =========================================================
+        arc_frame = ttk.Frame(self.arc_tab, padding=8)
+        arc_frame.pack(fill="both", expand=True)
+
+        ttk.Label(arc_frame, text="Motor A").grid(row=0, column=0, padx=6, pady=(6, 4))
+        ttk.Label(arc_frame, text="Motor B").grid(row=0, column=1, padx=6, pady=(6, 4))
+        ttk.Label(arc_frame, text="Radius A (steps)").grid(row=0, column=2, padx=6, pady=(6, 4))
+        ttk.Label(arc_frame, text="Radius B (steps)").grid(row=0, column=3, padx=6, pady=(6, 4))
+        ttk.Label(arc_frame, text="Angle (deg)").grid(row=0, column=4, padx=6, pady=(6, 4))
+        ttk.Label(arc_frame, text="Direction").grid(row=0, column=5, padx=6, pady=(6, 4))
+        ttk.Label(arc_frame, text="Segment Time (us)").grid(row=0, column=6, padx=6, pady=(6, 4))
+
+        self.arc_motor_a_var = tk.StringVar(value="0")
+        self.arc_motor_b_var = tk.StringVar(value="3")
+        self.arc_radius_a_steps_var = tk.StringVar(value="4000")
+        self.arc_radius_b_steps_var = tk.StringVar(value="4000")
+        self.arc_angle_deg_var = tk.StringVar(value="90")
+        self.arc_dir_var = tk.StringVar(value="CCW")
+        self.arc_segment_time_us_var = tk.StringVar(value="1000")
+
+        ttk.Combobox(
+            arc_frame,
+            textvariable=self.arc_motor_a_var,
+            values=[str(i) for i in range(MOTOR_COUNT)],
+            width=7,
+            state="readonly",
+        ).grid(row=1, column=0, padx=6, pady=(2, 8))
+
+        ttk.Combobox(
+            arc_frame,
+            textvariable=self.arc_motor_b_var,
+            values=[str(i) for i in range(MOTOR_COUNT)],
+            width=7,
+            state="readonly",
+        ).grid(row=1, column=1, padx=6, pady=(2, 8))
+
+        ttk.Entry(
+            arc_frame,
+            textvariable=self.arc_radius_a_steps_var,
+            width=13,
+        ).grid(row=1, column=2, padx=6, pady=(2, 8))
+
+        ttk.Entry(
+            arc_frame,
+            textvariable=self.arc_radius_b_steps_var,
+            width=13,
+        ).grid(row=1, column=3, padx=6, pady=(2, 8))
+
+        ttk.Entry(
+            arc_frame,
+            textvariable=self.arc_angle_deg_var,
+            width=10,
+        ).grid(row=1, column=4, padx=6, pady=(2, 8))
+
+        ttk.Combobox(
+            arc_frame,
+            textvariable=self.arc_dir_var,
+            values=["CW", "CCW"],
+            width=8,
+            state="readonly",
+        ).grid(row=1, column=5, padx=6, pady=(2, 8))
+
+        ttk.Entry(
+            arc_frame,
+            textvariable=self.arc_segment_time_us_var,
+            width=14,
+        ).grid(row=1, column=6, padx=6, pady=(2, 8))
+
+        ttk.Label(
+            arc_frame,
+            text=(
+                "Arduino splits the arc into 1° segments. Radius A/B are entered in motor steps; "
+                "Segment Time is the target time for each 1° segment."
+            ),
+            wraplength=590,
+            justify="left",
+        ).grid(
+            row=2,
+            column=0,
+            columnspan=7,
+            padx=8,
+            pady=(8, 6),
+            sticky="w",
+        )
+
+        self.arc_move_btn = ttk.Button(
+            arc_frame,
+            text="Start Arc Move",
+            command=self.send_arc_move,
+        )
+        self.arc_move_btn.grid(
+            row=3,
+            column=0,
+            columnspan=7,
+            padx=8,
+            pady=(4, 10),
+            sticky="ew",
+        )
+
+        for col in range(7):
+            arc_frame.columnconfigure(col, weight=1)
 
         # =========================================================
         # Serial Monitor
@@ -599,16 +728,19 @@ class StepperGUI:
     # =============================================================
     # Dual Motor Control
     # Arduino syntax:
-    # D_MOVE motorA stepsA motorB stepsB delay_us ramp
+    # D_MOVE motorA dirA stepsA delayA motorB dirB stepsB delayB
     # =============================================================
     def send_dual_move(self):
         try:
             motor_a = int(self.dual_motor_a_var.get())
+            dir_a = 0 if self.dual_dir_a_var.get() == "Dir 0" else 1
             steps_a = int(self.dual_steps_a_var.get())
+            delay_a_us = int(self.dual_delay_a_us_var.get())
+
             motor_b = int(self.dual_motor_b_var.get())
+            dir_b = 0 if self.dual_dir_b_var.get() == "Dir 0" else 1
             steps_b = int(self.dual_steps_b_var.get())
-            delay_us = int(self.dual_delay_us_var.get())
-            ramp = int(self.dual_ramp_var.get())
+            delay_b_us = int(self.dual_delay_b_us_var.get())
 
             if motor_a < 0 or motor_a >= MOTOR_COUNT:
                 raise ValueError(f"Motor A 必須是 0～{MOTOR_COUNT - 1}")
@@ -619,24 +751,72 @@ class StepperGUI:
             if motor_a == motor_b:
                 raise ValueError("Motor A 與 Motor B 不可選同一顆 Motor")
 
+            if steps_a < 0 or steps_b < 0:
+                raise ValueError("Steps A / B 不可小於 0，方向請使用 Dir A / Dir B 設定")
+
             if steps_a == 0 and steps_b == 0:
                 raise ValueError("Steps A 與 Steps B 不可同時為 0")
 
-            if delay_us <= 0:
-                raise ValueError("delay 必須大於 0")
+            if steps_a > 0 and delay_a_us <= 0:
+                raise ValueError("Delay A 必須大於 0")
 
-            if ramp < 0:
-                raise ValueError("ramp 不可小於 0")
+            if steps_b > 0 and delay_b_us <= 0:
+                raise ValueError("Delay B 必須大於 0")
 
             command = (
-                f"D_MOVE {motor_a} {steps_a} "
-                f"{motor_b} {steps_b} {delay_us} {ramp}"
+                f"D_MOVE {motor_a} {dir_a} {steps_a} {delay_a_us} "
+                f"{motor_b} {dir_b} {steps_b} {delay_b_us}"
             )
             self.send_command(command)
 
         except ValueError as error:
             messagebox.showerror("Input Error", str(error))
             self.log(f"Dual input error: {error}", source="Error")
+
+    # =============================================================
+    # Arc Motion
+    # Arduino syntax:
+    # ARC motorA motorB radiusA_steps radiusB_steps angle_deg dir segmentTimeUS
+    # dir: 0 = CW, 1 = CCW
+    # =============================================================
+    def send_arc_move(self):
+        try:
+            motor_a = int(self.arc_motor_a_var.get())
+            motor_b = int(self.arc_motor_b_var.get())
+            radius_a_steps = int(self.arc_radius_a_steps_var.get())
+            radius_b_steps = int(self.arc_radius_b_steps_var.get())
+            angle_deg = int(self.arc_angle_deg_var.get())
+            arc_dir = 0 if self.arc_dir_var.get() == "CW" else 1
+            segment_time_us = int(self.arc_segment_time_us_var.get())
+
+            if motor_a < 0 or motor_a >= MOTOR_COUNT:
+                raise ValueError(f"Motor A 必須是 0～{MOTOR_COUNT - 1}")
+
+            if motor_b < 0 or motor_b >= MOTOR_COUNT:
+                raise ValueError(f"Motor B 必須是 0～{MOTOR_COUNT - 1}")
+
+            if motor_a == motor_b:
+                raise ValueError("Motor A 與 Motor B 不可選同一顆 Motor")
+
+            if radius_a_steps <= 0 or radius_b_steps <= 0:
+                raise ValueError("Radius A / B 必須大於 0 steps")
+
+            if angle_deg <= 0 or angle_deg > 360:
+                raise ValueError("Angle 必須在 1～360 degree")
+
+            if segment_time_us <= 0:
+                raise ValueError("Segment Time 必須大於 0 us")
+
+            command = (
+                f"ARC {motor_a} {motor_b} "
+                f"{radius_a_steps} {radius_b_steps} "
+                f"{angle_deg} {arc_dir} {segment_time_us}"
+            )
+            self.send_command(command)
+
+        except ValueError as error:
+            messagebox.showerror("Input Error", str(error))
+            self.log(f"Arc input error: {error}", source="Error")
 
     # =============================================================
     # Emergency Stop
