@@ -6,7 +6,6 @@ import threading
 import queue
 import time
 
-
 BAUD_RATE = 115200
 
 

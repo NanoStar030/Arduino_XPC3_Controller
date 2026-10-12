@@ -584,13 +584,18 @@ class StepperGUI:
     # =============================================================
     def refresh_ports(self):
         ports = serial.tools.list_ports.comports()
+
         port_list = [port.device for port in ports]
+
+        # Add Wokwi as a virtual connection option
+        port_list.insert(0, "Wokwi Simulator")
+
         self.port_combo["values"] = port_list
 
-        if port_list:
+        current_port = self.port_var.get()
+
+        if current_port not in port_list:
             self.port_var.set(port_list[0])
-        else:
-            self.port_var.set("")
 
     def toggle_connection(self):
         if self.ser and self.ser.is_open:
@@ -606,11 +611,18 @@ class StepperGUI:
             return
 
         try:
-            self.ser = serial.Serial(
-                port=port,
-                baudrate=BAUD_RATE,
-                timeout=0.1,
-            )
+            if port == "Wokwi Simulator":
+                self.ser = serial.serial_for_url(
+                    "rfc2217://localhost:4000",
+                    baudrate=BAUD_RATE,
+                    timeout=0.1,
+                )
+            else:
+                self.ser = serial.Serial(
+                    port=port,
+                    baudrate=BAUD_RATE,
+                    timeout=0.1,
+                )
 
             # Arduino 開啟 Serial 後通常會 Reset
             time.sleep(2)

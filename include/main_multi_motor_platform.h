@@ -7,7 +7,7 @@
 // ==================================================
 constexpr int MOTOR_COUNT = 4;
 constexpr int LINE_BUF_SIZE = 128;
-
+constexpr int MIN_MOTOR_STEPS = 50;
 // ==================================================
 // Global Variables
 // ==================================================

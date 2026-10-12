@@ -4,10 +4,10 @@
 // ==================================================
 // CONFIGURATION
 // ==================================================
-const unsigned long START_DELAY_US = 5000;  // microseconds
 const unsigned long MAX_DELAY_US = 5000;    // microseconds
 const unsigned long MIN_DELAY_US = 50;      // microseconds
 const float ARC_ANGLE_PER_POINT = 10.0;     // degrees
+const int MOTOR_RAMP_RATIO = 4;  // rampSteps = totalSteps / MOTOR_RAMP_RATIO
 
 // ==================================================
 // Direction
@@ -21,6 +21,16 @@ enum class ArcDirection {
     CLOCKWISE = 1,
     COUNTERCLOCKWISE = -1
 };
+
+
+enum class MotorStatus {
+    IDEL = 0,
+    ACCEL = 1,
+    DECEL = 2,
+    CONST = 3
+};
+
+unsigned long checkDelayUSLimit(unsigned long delayUS);
 
 // ==================================================
 // Motor Class
@@ -36,14 +46,17 @@ private:
 
     unsigned long lastStepUS;
 
-    Direction direction;
     bool active;
+    bool updated;
+    bool isConti;
 
-    int rampSteps;
+    MotorStatus status;
+    Direction direction;
 
     unsigned long startDelayUS;
     unsigned long targetDelayUS;
     unsigned long currentDelayUS;
+
     unsigned long deltaDelayUS;
 
     void pulse();
@@ -53,12 +66,16 @@ public:
     Motor(int stepPin, int dirPin, int enaPin = -1);
 
     void begin();
-    void setMotion(Direction dir, int steps, unsigned long delayUS, int rampSteps = 0);
-    void updateMotion();
     void stop();
+    void setMotion(Direction dir, int steps, unsigned long startDelayUS, unsigned long targetDelayUS, bool _isConti = false);
+    void updateMotion();
 
     bool isMoving() const;
-    int getCurrentStep() const;
+    bool isUpdated() const;
+
     int getTotalSteps() const;
+    int getCurrentStep() const;
     int getRemainingSteps() const;
+    unsigned long getCurrentDelayUS() const;
+    MotorStatus getStatus() const;
 };
